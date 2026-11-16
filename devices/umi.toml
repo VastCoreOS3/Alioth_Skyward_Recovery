@@ -1,0 +1,146 @@
+# Xiaomi Mi 10 (umi). The phone keeps no slot of its own: its boot, recovery
+# and dtbo partitions are single, and it boots a system the recovery of which
+# was last built with a boot image header of version 2. Everything below is
+# taken from the phone itself, on HyperOS 1.0.7.0 (OS1.0.7.0.TJBCNXM), the
+# last stock build of its maker.
+[device]
+codename = "umi"
+brand = "Xiaomi"
+model = "Xiaomi Mi 10"
+# No slots: the phone's boot, recovery and dtbo partitions are single.
+ab = false
+soc = { hans = "骁龙®865移动平台", hant = "Snapdragon® 865 行動平台", en = "Snapdragon® 865 Mobile Platform" }
+os_version_prop = "ro.mi.os.version.incremental"
+# The maker names its OS as this, before the version; and a hotfix its its
+# own partition carries after it, as the pages name what runs: HyperOS
+# 4.0.29.0.XEOCNXM.D01, the sub-version from mi_ext's own build.prop.
+os_version_prefix = "HyperOS"
+os_version_sub_prop = "ro.mi.xms.version.incremental"
+
+[display]
+width = 1080
+height = 2340
+density = 440
+diagonal = 6.67
+
+[modules]
+# The kernel's own module folder in the vendor partition. The umi kernel was
+# built with no CONFIG_RD_LZ4: a ramdisk packed for it goes out in gzip.
+sources = ["vendor"]
+# The touchscreen is built into the kernel; nothing of the vendor's own is
+# loaded for it.
+
+# The persist partition, which the phone mounts at /mnt/vendor/persist and
+# its own recovery leaves unmounted. The WLAN's MAC address is there, and the
+# fingerprint data too.
+[partitions]
+mounted = ["persist"]
+
+# What the phone's own init runs once the system has finished starting, as
+# kernel-post-boot in /vendor/etc/init/hw/init.qcom.rc: the kernel starts
+# both CPU clusters on the performance governor, and the script hands them to
+# schedutil, which lets idle CPUs power down. Without it the CPUs stay at
+# their highest clock even while idle, and the phone slowly heats up.
+[[service]]
+path = "/vendor/bin/sh"
+args = ["/vendor/bin/init.qcom.post_boot.sh"]
+libraries = ["/system/lib64", "/vendor/lib64"]
+oneshot = true
+# The ported system's script ends in a chmod on a folder of a mounted data
+# partition, which a recovery mounts none of: what it set out to do by then
+# it has done, so its failure is said and the rest still start.
+best_effort = true
+user = "root"
+groups = ["root", "system", "wakelock", "graphics"]
+
+# WLAN: the WCN3988 on the phone's PCIe, driven by the qca_cld3 module the
+# vendor partition carries, which the phone's own init loads the same way:
+# the kernel carries cnss2, which powers the chip and loads its firmware
+# once the module registers with it. The module was built against the
+# release its stock kernel runs, so its version magic does not name this
+# kernel, but the load takes it the same way the phone's own does, without
+# checking the magic. The cnss layer adds the chip's own folder to the
+# firmware names it asks the kernel's loader for — qca6390/amss.bin,
+# qca6390/bdwlan.bin, qca6390/m3.bin, qca6390/regdb.bin — and qcacld asks
+# for the cfg and the MAC under wlan/qca_cld/qca6390/; the kernel looks
+# for all of them under /lib/firmware before anything else. The modem
+# partition keeps the images themselves in its own qca6390 folder, named
+# with the fallback names the driver also looks for, so every one is
+# copied under both names for the loader to find whichever it asks for.
+# Once the module is loaded and fs_ready written, cnss2 powers the chip
+# up, the driver registers its network devices, and wlan0 appears. The MAC
+# address comes from where the phone itself keeps it, at the top of
+# persist.
+[wlan]
+modules = ["qca_cld3_qca6390"]
+writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
+firmware = [
+    { name = "wlan/qca_cld/qca6390/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/qca6390/WCNSS_qcom_cfg.ini" },
+    { name = "wlan/qca_cld/qca6390/wlan_mac.bin", partition = "persist", path = "wlan_mac.bin" },
+    { name = "qca6390/amss.bin", partition = "modem", path = "image/qca6390/amss20.bin" },
+    { name = "qca6390/amss20.bin", partition = "modem", path = "image/qca6390/amss20.bin" },
+    { name = "qca6390/m3.bin", partition = "modem", path = "image/qca6390/m3.bin" },
+    { name = "qca6390/bdwlan.bin", partition = "modem", path = "image/qca6390/bdwlan.elf" },
+    { name = "qca6390/regdb.bin", partition = "modem", path = "image/qca6390/regdb.bin" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+libraries = ["/vendor/lib64", "/system/lib64"]
+# The supplicant of this phone is of the older kind that registers with the
+# hardware directory, but the recovery drives it over its control socket,
+# which is ready once the process is, and asks no directory for it: the name
+# is the one Skyward's own description of it publishes.
+service = "android.hardware.wifi.supplicant.ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+# The vibration motor: an Awinic AW8697 on i2c-2 at 005a, named aw8697_haptic.
+# Its force-feedback bitmap (120070000) carries FF_CUSTOM, FF_CONSTANT,
+# FF_SPRING, FF_FRICTION and FF_GAIN but no FF_PERIODIC, so the kernel's
+# periodic effect path that Skyward's own clicks use cannot reach it. The
+# driver drives the motor from its own sysfs files instead, which is what the
+# recovery writes; the mode it boots in has to be cleared first, or activate
+# plays an empty waveform. Driven at the motor's own resonance, which the
+# phone reports in tenths of a hertz.
+[haptics]
+aw8697 = "/sys/bus/i2c/devices/2-005a"
+resonance = "/sys/bus/i2c/devices/2-005a/f0"
+strength = { lightest = 0.25, strongest = 0.75 }
+
+# The update server the stock updater of the Chinese system asks.
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+# The stock build the recovery is made on: the Chinese system's HyperOS
+# 1.0.3.0, whose fastboot package held the recovery partition the recovery is
+# built on top of. The maker's own copy of that package answers some requests
+# and refuses others, so the file the build reads is the same tarball as the
+# maker's, holding only its recovery image, kept beside the build; the SHA-256
+# is of the recovery image as the maker's package holds it, and the build
+# checks it as it always does.
+[stock]
+version = "OS1.0.3.0.TJBCNXM"
+package = "https://github.com/mouya-q/skyward/releases/download/umi-stock/umi_images_OS1.0.3.0.TJBCNXM_20240320.0000.00_13.0_cn_b616f9f481.tgz"
+recovery = "1f585ba45fd1a59909a706462c58b166a4ad6a0528558c76368fc1e274559597"
+
+# The partitions a backup of the baseband and EFS takes: the baseband's
+# settings, with the IMEI, and the sensors' calibration. And what of the
+# data partition a backup leaves out because the secure world keeps it in
+# step with itself: its own storage, its apps' data and the fingerprint
+# templates.
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = ["vendor/tzstorage", "vendor/qtee", "vendor/fingerprint", "vendor/fpc", "vendor/goodix", "vendor/misys"]
+
+# Where the phone's own programs keep logs in the data partition: the
+# system's, the last kernel and logcat lines the diag service saves at each
+# start, and what the modem, Wi-Fi and Bluetooth leave when they crash.
+[wipe]
+logs = [
+    "/data/miuilog",
+    "/data/vendor/diag",
+    "/data/vendor/log",
+    "/data/vendor/ramdump",
+    "/data/vendor/ramdump_ssr",
+    "/data/vendor/ssrdump",
+    "/data/vendor/tombstones",
+    "/data/vendor/wlan_logs",
+]

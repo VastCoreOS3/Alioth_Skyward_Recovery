@@ -1,0 +1,272 @@
+# Skyward on the Xiaomi Mi 10 (`umi`)
+
+This is a port of [Skyward](https://github.com/kirklin/skyward), the recovery
+written from scratch in Rust, to the Xiaomi Mi 10 (codename `umi`, Qualcomm
+SM8250 / Snapdragon 865, kernel 4.19, single-slot). It carries the device
+configuration and the code changes the phone's firmware needs, which are the
+older boot image header the phone's recovery is packed with and the gzip
+ramdisk its kernel reads.
+
+The phone runs a ported HyperOS 4 (`OS4.0.29.0.XEOCNXM`) whose vendor side is
+the stock Android 13 vendor of the phone's last official build. The port is
+built on the official HyperOS 1.0.3.0 (`OS1.0.3.0.TJBCNXM`) fastboot package,
+whose recovery partition it takes as the base and names in `[stock]`.
+
+## What is different from a phone the upstream tree already carries
+
+Everything below was read from the phone itself, not assumed from another
+device.
+
+| Fact | Value on `umi` | Consequence |
+| --- | --- | --- |
+| Boot image header | **version 2** | Upstream `skyward-bootimg` refused v0-v2 outright (`bail!`); a v2 header carries the kernel, the ramdisk, a recovery DTBO and the DTB the bootloader starts from, none of which v3 has. |
+| Ramdisk compression | **gzip** | The kernel was built with `CONFIG_RD_GZIP=y` and `# CONFIG_RD_LZ4 is not set`. Upstream packed every ramdisk in LZ4, which this kernel cannot read. |
+| Slots | **none** (single boot, recovery, dtbo) | `ab = false`. Dual boot and boot-control work are not offered; the install page hides them on its own, as they key off `boot_a`/`boot_b`. |
+| Stock package | **fastboot tarball** | The phone's OTA is an sdat card package with no `payload.bin` and no `recovery.img`; the recovery partition only comes from a fastboot package, a `.tgz` of the partition images. Upstream read only OTA payloads (`.zip`). |
+| Touchscreen | **built into the kernel** | No module to load; `[modules] load` stays empty. |
+| WLAN | **built into the kernel** (`wlan` + `cnss2`) | The ported system's kernel carries the driver built in, so no module is loaded. The driver asks the firmware loader for the chip's images by **plain names** (`amss.bin`, `bdwlan.bin`, `regdb.bin`, the cfg and the MAC); the modem partition carries them in `image/qca6390/` under the fallback names (`amss20.bin`, `bdwlan.elf`, …), and the kernel looks for all of them under `/lib/firmware` first. |
+| Super partitions | **erofs** | The ported system's `super` holds every logical partition as erofs, which the stock `OS1.0.3.0` kernel does not read (`EROFS` absent from its strings). The recovery is assembled onto the **boot partition's own kernel** — the one the phone runs every day — so erofs mounts; see *Assembling* below. |
+| Vibration motor | **AW8697** (`aw8697_haptic`, i2c-2 005a) | Its force-feedback bitmap (`120070000`) carries none of `FF_PERIODIC`/`FF_CUSTOM`, so Skyward's force-feedback click cannot drive it. `[haptics]` is left out; the recovery runs with no vibration. |
+| Secure services | **HIDL** `keymaster@4.x`, `gatekeeper@1.0` | Skyward's crypto stack speaks the AIDL `IKeyMintDevice` of Android 13+. This phone's firmware registers no KeyMint AIDL service, so decrypting the data partition from the recovery is **not available** on this port. |
+| Display | **1080x2340 @440**, `j2_mp_42_02_0b_dsc_cmd` | The KMS path reads the connector's mode and topology itself; no per-model display code was needed. |
+| OS version property | `ro.build.version.incremental` | The phone carries no `ro.mi.os.version.incremental` in the recovery's own property set. |
+
+## The code changes
+
+Narrow, and each confined to what the phone's firmware requires.
+
+1. **`crates/skyward-bootimg/src/image.rs`** — `BootImage` now keeps the header
+   it read (`Header`, not `HeaderV3`) and, for versions 0-2, the sections after
+   the ramdisk (`second_bootloader`, `recovery_dtbo`, `dtb`) as they were read.
+   `parse` reads them; `to_bytes` writes the header back in its own version and
+   lays the sections out again the same way, so the bootloader finds its DTB
+   where it looks for it. A version 3/4 image is byte-for-byte what it was.
+
+   A version 1 or 2 header also *names* where its recovery DTBO lands, in a
+   64-bit field at byte 1636. Because a rebuilt ramdisk is a different size,
+   the sections after it move, and that field is rewritten to the offset this
+   layout gives them. Without that rewrite the bootloader reads the DTBO from
+   where the stock image had it — into the middle of the new ramdisk — and the
+   dtbo/dm-dtbo step fails. (Found on the first real artifact: the header said
+   73,285,632 while the DTBO had moved to 91,615,232.)
+2. **`crates/skyward-bootimg/src/ramdisk.rs`** — `decode` takes gzip as well as
+   LZ4 (the `1f 8b` magic in front chooses); `encode_gzip` packs a rebuilt
+   archive the way the phone's kernel reads it. `flate2` is the new dependency.
+3. **`crates/skyward-pack/src/main.rs`** — the recovery is compressed to match
+   the header version it was read with (gzip for v0-2, LZ4 for v3/4); `stock`
+   takes the recovery image out of a fastboot tarball as well as an OTA payload,
+   streamed from its server and read only as far as `recovery.img`.
+4. **`crates/skyward-config/src/lib.rs`** — `[stock] package` may be a `.tgz`
+   as well as a `.zip`.
+5. **`devices/umi.toml`** — the device configuration, every field taken from the
+   phone.
+6. **`crates/skyward/src/main.rs`** — a phone with no slots no longer stops the
+   UI from starting: `booted_slot()`, which turned `Ok(None)` into an error
+   ("not an A/B device"), is replaced by a match on
+   `skyward_vab::current_slot()` — `Ok(Some(slot))` prepares as before,
+   anything else logs the fact to kmsg and carries on. The whole-partition
+   mount path below then does the work the slot path would have.
+7. **`crates/skyward-vab/src/partitions.rs`** — the suffix the logical
+   partitions actually carry in `super` is derived from the partition names the
+   metadata lists (`suffix_of`: `system_a` → `_a`, `system` → empty) instead of
+   assuming the slot's own `_a`/`_b`; every place that spelled a partition
+   name, matched one, or stripped a suffix (`slot_partitions`, `base`,
+   `map_and_mount`, `mount_snapshot`, `mount_mapped`, `slot_bases`,
+   `slot_sizes`, `map_whole`, `mount_one`, `mounted_partitions`,
+   `unmount_partitions`) follows the actual suffix, so whole-partition
+   (`no-slot`) phones mount. `skyward-info` and the mount list of the UI follow.
+8. **`crates/skyward/src/ui.rs`** — a panel that carries no normal-maximum
+   brightness property in its device-tree node, as an early-2024 DTB of a
+   2020 phone does, no longer fails the UI: the whole backlight range the
+   panel offers is then its normal maximum. (`qcom,mdss-dsi-bl-max-level` is
+   added as a pairing fallback: it pairs with itself, which scales nothing,
+   but makes the level the factory property of the Qualcomm pairing is
+   measured against readable when no `mi,*` pair exists.)
+9. **`crates/skyward-crypto/src/data.rs`** — a phone whose table names no
+   `metadata_encryption` for the data partition leaves it in the clear, as
+   this phone's does (an f2fs with `inlinecrypt` and no encryption extra);
+   such a partition is mounted as it stands, with no key unwrapped, no
+   device-mapper layer, and — the part that matters here — **no key service
+   at all**. That is what makes the data partition mountable on this phone,
+   whose key service is HIDL and whose recovery carries no binder device.
+   `crates/skyward/src/decrypt.rs` reads the table first and only reaches
+   for the key service where the table says the partition is encrypted;
+   `crates/skyward/src/partwork.rs` repairs the filesystem of a clear
+   partition through the partition itself.
+10. **`crates/skyward/src/haptics.rs`** — the AW8697 motor is driven through
+    its own sysfs files (`activate_mode` cleared to 0, `duration`,
+    `gain`, `activate`), at a gain inside the driver's 7-bit register (127
+    full — a larger value wraps and drives the motor with a torn waveform,
+    heard as a rattle), for its force-feedback bitmap carries no periodic
+    effect. `devices/umi.toml` carries the `[haptics]` node pointing at the
+    motor's sysfs folder.
+
+## Building
+
+The GitHub Actions workflow builds for `umi` alone on a plain push, as the
+phone this fork ports to; a tag, or a run by hand, still builds the devices it
+names, or every `devices/*.toml` when it names none. It takes the recovery
+image out of the stock fastboot package, verifies its SHA-256 against the
+configuration, and packs the recovery on top of it.
+
+The maker's own copy of that package (`cdnorg.d.miui.com`,
+`bigota.d.miui.com`) answers some requests and refuses others — it served a
+`HEAD` here and returned `403` to a browser, and a CI job streaming 5.6 GiB from
+it hung for over thirty minutes before being cancelled. The base is therefore a
+tarball of just the recovery image, uploaded as a release asset of this fork at
+the tag `umi-stock`, and `[stock] package` points at that. The SHA-256 in the
+configuration is of the recovery image as the maker's package holds it, so the
+check still proves the base is the maker's own bytes.
+
+The artifact is `skyward-<ref>-umi-OS1.0.3.0.TJBCNXM.zip`, holding one file,
+`skyward-<ref>-umi-OS1.0.3.0.TJBCNXM.img`, exactly 128 MiB.
+
+## Assembling onto the phone's own kernel
+
+The image the CI builds carries the **stock kernel of `OS1.0.3.0`**, which
+reads no erofs — and the ported system's `super` holds every logical
+partition as erofs, so nothing mounts. The image is therefore assembled
+again on the phone, onto the **`boot` partition's own kernel, DTB and its
+recovery DTBO** — the three parts the phone's own recovery (TWRP, before
+this port replaced it) starts from, proven to start on this bootloader:
+
+- the kernel, DTB and recovery DTBO come from the running `boot` and the
+  TWRP backup (the DTB and DTBO are a matched pair; a stock DTB with a
+  ported DTBO laid over it is a mismatch the bootloader refuses, which
+  reads as a dead boot straight into fastboot);
+- the ramdisk is the built image's own, untouched — every fix below rides
+  along;
+- the AVB footer is rebuilt for the assembled image, as `skyward-pack`
+  builds it, and laid **at the end of the partition** — the bootloader
+  reads it there, and gives up on the whole slot when it finds anything
+  but a vbmeta image where it points. An assembled image whose footer sat
+  next to the vbmeta (twice built, twice) put the phone in fastboot on
+  every key, and the running system with it.
+
+The assembler is `swap_kernel.py` (kept beside this document in the
+working tree, not the repository); the assembled image is checked entry by
+entry (header fields, section magics, footer, vbmeta hash) before it is
+written.
+
+## Installing and recovering
+
+The image fills the `recovery` partition. **On this phone `recovery` is not a
+slot** — flashing the image writes the recovery; the running system is
+untouched, for the system lives in `boot` and in the `super` dynamic
+partitions. To go back, flash the stock recovery from the same fastboot
+package:
+
+```
+fastboot flash recovery recovery.img
+```
+
+`avbctl` inside Skyward and the recovery's own settings can turn verified
+boot's checks off when a package the system rejects has to be installed, as on
+any phone the upstream tree carries. There is no slot to fall back to; keep
+the stock `recovery.img` from the fastboot package to hand.
+
+## Known limitations on this port
+
+- **No data decryption.** The phone's key service is HIDL `keymaster@4.x`;
+  Skyward asks for the AIDL KeyMint device and finds none. The data partition
+  cannot be opened with the screen lock from the recovery — and this phone's
+  data partition is not encrypted at all (no `metadata_encryption` in its
+  fstab; plain f2fs), so it mounts without the key service anyway; see the
+  code changes below.
+- **Vibration is driven through the driver's own files.** The AW8697 driver
+  takes no periodic force-feedback effect, which is the only path Skyward's
+  click uses upstream; the port drives the motor through its sysfs files
+  instead, at the driver's own durations and gains. What plays is the
+  driver's RAM one-shot, not the made waveform the periodic path plays, so
+  the click is a plain pulse rather than a shaped one.
+- **Dual boot is not offered.** The phone has no slots.
+- **WLAN is untested on hardware.** The module, its firmware files and the
+  supplicant are all present and configured from the phone; the bring-up path
+  (cnss2, `fs_ready`, the control socket) has not yet been run on the device.
+
+## Verification status
+
+Read this honestly; each line is a claim with its evidence.
+
+- **Implemented** — the changes above exist in the tree.
+- **Parsed offline** — the stock recovery of the maker's fastboot package
+  (header v2, gzip ramdisk, a 14,055,186-byte recovery DTBO and a
+  1,613,904-byte DTB after it) was read by an independent Python parser that
+  follows the boot image v2 layout rules, and the built image was checked
+  against it, entry by entry:
+  - the partition is the full 134,217,728 bytes;
+  - the header keeps version 2, its page size, address and kernel size;
+  - the ramdisk is gzip, holds all 869 stock entries (867 of them byte for
+    byte identical) plus the 13 the port adds;
+  - the kernel is copied byte for byte (SHA-256 `eb7547b964eae158…`);
+  - `recovery_dtbo_offset` matches the rebuilt layout, and the DTBO
+    (14,055,186 bytes) and the DTB (1,613,904 bytes) are the stock bytes;
+  - the AVB footer names the image size and points at the vbmeta image the
+    packer wrote (`AVB0`, unsigned, as an unlocked bootloader wants).
+- **Compiled** — the CI runs on commits `85934802`, `94065d1a`/`a935fe91`,
+  `07942dde`, `bda503a3`, `22fe18e7`, `5509fb4e`, `c07d4923`, `6a7930e2`,
+  `1f3ab52e` and `677b167e` built the tools and this device's recovery;
+  `Lint and test` and `Build the recovery service and the packer` passed, and
+  `Recovery for umi` produced the image above. NOT RUN locally: no Rust
+  toolchain on the phone (`rustup-init` cannot spawn threads under this
+  proot).
+- **Flashed** — six builds have been written to the `recovery` partition
+  with `dd`, each read back and checked byte for byte (write 134,217,728
+  bytes; read-back SHA-256 equal). The stock TWRP the phone carried was
+  backed up first, to
+  `backup/twrp_recovery_umi_20261114_111830.img` (134,217,728 bytes,
+  SHA-256 `f4d4d5a705246fea2faceab88bd97897ab38383c6b6c1b127bd749dc2449e673`,
+  verified: header v2, gzip ramdisk, 3674 entries, `twres`/`sbin` intact),
+  and the maker's own `recovery.img` from the fastboot package stays on the
+  computer as the rollback of record. The TWRP backup has saved the phone
+  twice, after two assembled images whose footers were laid wrong put it in
+  fastboot on every boot — flashing the TWRP back brought the system up
+  again both times.
+- **Booted and running** — the UI comes up, the panel lights, the touch
+  works and the Menu page answers. Getting there took three fixes, each
+  found from the kernel log of a failed boot: `booted_slot()` no longer
+  fails a phone with no slots (`85934802`'s log: `not an A/B device`); a
+  panel with no normal-maximum brightness property no longer fails the UI
+  (`a935fe9`'s log: the recovery looped failing every five seconds); and
+  the assembled images now carry the footer at the partition's end
+  (`c07d-erofs`'s fastboot-on-every-key: the bootloader gave up on the
+  whole slot over a footer it could not read).
+- **Mounting verified on hardware** — the run of `22fe18e7`-assembled
+  (`32cba218`) mounted every logical partition from `super` (the
+  `/mnt/vendor/persist/skyward.log` it left behind reads: `mounted
+  mi_ext/odm/product/system/system_ext/vendor … (erofs)`, all six), checked
+  the data partition (f2fs, fsck exit 0) and mounted it in the clear. That
+  is the whole-partition mount path working end to end on the phone.
+- **Runtime / Hardware verified** — partially. Mounting is verified above;
+  wiping, installing and MTP have not been tried yet. The WLAN bring-up
+  (`677b167e`-assembled, `4396beaf`) carries the firmware the loader asks
+  for (`amss.bin`, `bdwlan.bin`, `regdb.bin` under `/lib/firmware`, from
+  the modem partition's own images); **its first run has not been reported
+  yet**. Two earlier runs without the firmware (`32cba218`) failed the
+  bring-up and, after a while, watchdog-reset the phone — the persist log
+  of that run was lost with the crash (f2fs, no checkpoint), so the
+  watchdog itself is read from the behaviour: the same image left alone
+  ran stable for minutes. What the log of `eca3804f` finally caught (the
+  `sync_all` on the persist log made it last the crash): the six erofs
+  partitions mounted at 3.7 s, and at 13.9 s `devices not brought up: the
+  service directory did not come back` — the previous build's fix to the
+  service descriptions made `ctl.restart servicemanager` reachable for the
+  first time, and `servicemanager` is one of init's `shutdown critical`
+  services: init read its death as the system's and rebooted to the
+  bootloader (`d7cddfe5` removed the restart, and the phone has been
+  stable since; the descriptions stay where the next start of
+  servicemanager reads them).
+- **Three more fixes from the `d7cddfe5` run's log** (`cf761f34`, flashed
+  as `b4b22331`): the WLAN firmware read died on `mount persist … Device
+  or resource busy` — the recovery itself mounts persist at boot, and the
+  kernel refuses a second mount of a block device it holds open, so a
+  firmware file off a partition the recovery has mounted is now read
+  where that partition already is; an image of `boot` was refused with
+  `NoPartition` — the partition links a no-slot phone carries carry no
+  `_a`/`_b` suffix, which the image placement now falls back to, and the
+  slot section of the flash page and the letters in its report are left
+  off where the phone has no slots; and the About page showed no system
+  version — a no-slot phone's properties are now read where its partitions
+  are mapped, and the version names the OS as its maker does:
+  `HyperOS4.0.29.0.XEOCNXM.D01`, the `D01` hotfix from `mi_ext`'s own
+  `build.prop`.
